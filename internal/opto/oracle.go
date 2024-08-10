@@ -14,63 +14,159 @@ type TraceOracle interface {
 }
 
 type traceOracle struct {
-	executor          func(context.Context, string) (interface{}, error)
-	graphBuilder      func(string, interface{}) Graph
-	feedbackGenerator func(interface{}) *Feedback
+	executor          func(context.Context, map[string]Parameter) (Graph, error)
+	graphBuilder      func(map[string]Parameter, interface{}) Graph
+	feedbackGenerator func(Graph) *Feedback
 }
 
 func NewTraceOracle(
-	executor func(context.Context, string) (interface{}, error),
-	graphBuilder func(string, interface{}) Graph,
-	feedbackGenerator func(interface{}) *Feedback,
+	executor interface{},
+	graphBuilder interface{},
+	feedbackGenerator interface{},
 ) TraceOracle {
 	return &traceOracle{
-		executor:          executor,
-		graphBuilder:      graphBuilder,
-		feedbackGenerator: feedbackGenerator,
+		executor:          adaptExecutor(executor),
+		graphBuilder:      adaptGraphBuilder(graphBuilder),
+		feedbackGenerator: adaptFeedbackGenerator(feedbackGenerator),
 	}
 }
 
 func (to *traceOracle) Execute(ctx context.Context, params map[string]Parameter) (Graph, *Feedback, error) {
-	// Assume we're dealing with a single prompt parameter for simplicity
-	var promptText string
-	for _, param := range params {
-		if promptParam, ok := param.(*PromptParameter); ok {
-			promptText = promptParam.GetPromptText()
-			break
-		}
-	}
-
-	if promptText == "" {
-		return nil, nil, fmt.Errorf("no valid prompt parameter found")
-	}
-
-	result, err := to.executor(ctx, promptText)
+	graph, err := to.executor(ctx, params)
 	if err != nil {
 		return nil, nil, fmt.Errorf("execution failed: %w", err)
 	}
 
-	graph := to.graphBuilder(promptText, result)
-	feedback := to.feedbackGenerator(result)
+	feedback := to.feedbackGenerator(graph)
 
 	return graph, feedback, nil
 }
 
+// Helper functions to adapt different function signatures
+
+func adaptExecutor(executor interface{}) func(context.Context, map[string]Parameter) (Graph, error) {
+	execValue := reflect.ValueOf(executor)
+	execType := execValue.Type()
+
+	switch {
+	case execType.NumIn() == 2 && execType.In(1) == reflect.TypeOf((*map[string]Parameter)(nil)).Elem():
+		// Already in the correct format
+		return executor.(func(context.Context, map[string]Parameter) (Graph, error))
+
+	case execType.NumIn() == 2 && execType.In(1) == reflect.TypeOf(""):
+		// Convert string-based executor to map-based
+		return func(ctx context.Context, params map[string]Parameter) (Graph, error) {
+			promptParam, ok := params["prompt"].(*PromptParameter)
+			if !ok {
+				return nil, fmt.Errorf("invalid prompt parameter")
+			}
+			results := execValue.Call([]reflect.Value{
+				reflect.ValueOf(ctx),
+				reflect.ValueOf(promptParam.GetPromptText()),
+			})
+			if len(results) != 2 {
+				return nil, fmt.Errorf("unexpected number of return values from executor")
+			}
+			result := results[0].Interface()
+			err := results[1].Interface()
+			if err != nil {
+				return nil, err.(error)
+			}
+			return NewDefaultGraphBuilder()(params, result), nil // Changed this line
+		}
+
+	default:
+		panic("unsupported executor signature")
+	}
+}
+
+func adaptGraphBuilder(graphBuilder interface{}) func(map[string]Parameter, interface{}) Graph {
+	builderValue := reflect.ValueOf(graphBuilder)
+	builderType := builderValue.Type()
+
+	switch {
+	case builderType.NumIn() == 2 && builderType.In(0) == reflect.TypeOf((*map[string]Parameter)(nil)).Elem():
+		// Already in the correct format
+		return graphBuilder.(func(map[string]Parameter, interface{}) Graph)
+
+	case builderType.NumIn() == 2 && builderType.In(0) == reflect.TypeOf(""):
+		// Convert string-based builder to map-based
+		return func(params map[string]Parameter, result interface{}) Graph {
+			promptParam, ok := params["prompt"].(*PromptParameter)
+			if !ok {
+				return NewGraph()
+			}
+			return builderValue.Call([]reflect.Value{
+				reflect.ValueOf(promptParam.GetPromptText()),
+				reflect.ValueOf(result),
+			})[0].Interface().(Graph)
+		}
+
+	default:
+		panic("unsupported graph builder signature")
+	}
+}
+
+func adaptFeedbackGenerator(feedbackGenerator interface{}) func(Graph) *Feedback {
+	genValue := reflect.ValueOf(feedbackGenerator)
+	genType := genValue.Type()
+
+	switch {
+	case genType.NumIn() == 1 && genType.In(0) == reflect.TypeOf((*Graph)(nil)).Elem():
+		// Already in the correct format
+		return feedbackGenerator.(func(Graph) *Feedback)
+
+	case genType.NumIn() == 1:
+		// Convert interface{}-based generator to Graph-based
+		return func(graph Graph) *Feedback {
+			outputNode := findOutputNode(graph)
+			if outputNode == nil {
+				return NewFeedback(0, "No output node found in graph")
+			}
+			return genValue.Call([]reflect.Value{
+				reflect.ValueOf(outputNode.Value()),
+			})[0].Interface().(*Feedback)
+		}
+
+	default:
+		panic("unsupported feedback generator signature")
+	}
+}
+
+// Helper function to find the output node in a graph
+func findOutputNode(graph Graph) Node {
+	var outputNode Node
+	graph.BFS(graph.Nodes()[0], func(node Node) bool {
+		if node.Type() == OutputNode {
+			outputNode = node
+			return false
+		}
+		return true
+	})
+	return outputNode
+}
+
 // NewDefaultGraphBuilder creates a default graph builder function for prompt-based workflows
-func NewDefaultGraphBuilder() func(string, interface{}) Graph {
-	return func(prompt string, result interface{}) Graph {
+func NewDefaultGraphBuilder() func(map[string]Parameter, interface{}) Graph {
+	return func(params map[string]Parameter, result interface{}) Graph {
 		g := NewGraph()
 
-		// Create nodes
-		promptNode := NewWorkflowNode("prompt", InputNode, prompt, nil)
-		resultNode := NewWorkflowNode("result", OutputNode, result, nil)
+		// Create input nodes for each parameter
+		for name, param := range params {
+			inputNode := NewWorkflowNode(name, InputNode, param.GetValue(), param)
+			g.AddWorkflowNode(inputNode)
+		}
 
-		// Add nodes to the graph
-		g.AddWorkflowNode(promptNode)
+		// Create result node
+		resultNode := NewWorkflowNode("result", OutputNode, result, nil)
 		g.AddWorkflowNode(resultNode)
 
-		// Connect nodes
-		resultNode.AddDependency(promptNode)
+		// Connect all input nodes to the result node
+		for _, node := range g.Nodes() {
+			if node.Type() == InputNode {
+				resultNode.AddDependency(node.(WorkflowNode))
+			}
+		}
 
 		return g
 	}

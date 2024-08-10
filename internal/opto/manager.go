@@ -37,132 +37,142 @@ func NewOPTOManager(oracle TraceOracle, context string, l llm.LLM) (*OPTOManager
 	}, nil
 }
 
-func (om *OPTOManager) Optimize(ctx context.Context, initialPrompt string, iterations int) (string, error) {
-	currentPrompt := initialPrompt
-	var bestPrompt string
+func (om *OPTOManager) Optimize(ctx context.Context, initialParams map[string]Parameter, iterations int) (map[string]Parameter, error) {
+	currentParams := initialParams
+	var bestParams map[string]Parameter
 	var bestScore float64
-	scores := make([]float64, 0, iterations)
 
 	for i := 0; i < iterations; i++ {
-		log.Printf("Iteration %d - Current Prompt: %s", i, currentPrompt)
+		log.Printf("Iteration %d", i)
 
-		// 1. Execute Trace Oracle
-		graph, feedback, err := om.oracle.Execute(ctx, map[string]Parameter{"prompt": NewPromptParameter(currentPrompt, "")})
+		// Execute Trace Oracle
+		graph, feedback, err := om.oracle.Execute(ctx, currentParams)
 		if err != nil {
-			return "", fmt.Errorf("optimization iteration %d failed: %w", i, err)
+			return nil, fmt.Errorf("optimization iteration %d failed: %w", i, err)
 		}
 
-		// 2. Update parameters using OptoPrime
-		updatedPrompt, err := om.OptoPrime(currentPrompt, graph, feedback, om.context, scores)
+		// Update parameters using OptoPrime
+		updates, err := om.OptoPrime(graph, feedback, om.context)
 		if err != nil {
-			return "", fmt.Errorf("parameter update failed at iteration %d: %w", i, err)
+			return nil, fmt.Errorf("parameter update failed at iteration %d: %w", i, err)
 		}
 
-		score := scorePrompt(updatedPrompt, feedback)
-		scores = append(scores, score)
+		// Apply updates to current parameters
+		for name, value := range updates {
+			if param, ok := currentParams[name]; ok {
+				param.SetValue(value)
+			}
+		}
 
-		log.Printf("Iteration %d - Updated Prompt: %s", i, updatedPrompt)
+		score := feedback.Score
 		log.Printf("Iteration %d - Score: %f", i, score)
 
 		if score > bestScore {
 			bestScore = score
-			bestPrompt = updatedPrompt
-		}
-
-		currentPrompt = updatedPrompt
-
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return bestPrompt, ctx.Err()
-		default:
-
+			bestParams = copyParams(currentParams)
 		}
 	}
 
-	return bestPrompt, nil
-}
-func (om *OPTOManager) preparePrompt(prompt string, graph Graph, feedback *Feedback, ctx string, scores []float64) string {
-	graphStr := graphToString(graph)
-	scoresStr := fmt.Sprintf("%v", scores)
-
-	basePrompt := fmt.Sprintf(`
-Analyze the following information and suggest improvements to the algorithm. Your response must be a single JSON object with the following structure:
-
-{
-    "reasoning": "Your step-by-step reasoning for the suggested changes",
-    "suggestion": "The updated algorithm",
-    "prompt": "The new prompt to be used"
+	return bestParams, nil
 }
 
+func (om *OPTOManager) preparePrompt(subgraph *TraceGraph, feedback *Feedback, ctx string) string {
+	return fmt.Sprintf(`
 Context: %s
 
-Current Algorithm:
+Optimization Goal: Improve the parameters of the computational workflow represented by the graph structure below.
+
+Graph Structure:
 %s
 
-Execution Trace:
-%s
-
-Feedback:
+Current Performance:
 Score: %.2f
-Message: %s
+Feedback: %s
 
-Previous Scores: %s
+Previous Iterations: [You can add information about previous iterations here if available]
 
-Consider the trend in previous scores when suggesting improvements. Aim for prompts that are likely to score higher based on observed patterns.
+Task:
+1. Analyze the graph structure, current performance, and feedback.
+2. Consider the context and optimization goal.
+3. Suggest improvements to the parameters to optimize the output.
 
-Ensure your response is a valid JSON object and does not include any text or formatting outside the JSON structure.`,
-		ctx, prompt, graphStr, feedback.Score, feedback.Message, scoresStr)
+Your response should be a JSON object where keys are parameter names and values are the suggested updates.
+Provide reasoning for each suggested update.
 
-	return basePrompt
+Example format:
+{
+    "param1": {"value": "new_value", "reasoning": "explanation for this update"},
+    "param2": {"value": 42, "reasoning": "justification for this change"}
 }
 
-func (om *OPTOManager) OptoPrime(prompt string, graph Graph, feedback *Feedback, ctx string, scores []float64) (string, error) {
-	promptStr := om.preparePrompt(prompt, graph, feedback, ctx, scores)
+Remember to consider the interactions between parameters and the overall optimization goal.
+`, ctx, subgraphToString(subgraph), feedback.Score, feedback.Message)
+}
 
-	response, _, err := om.llm.Generate(context.Background(), promptStr)
+func traceGraphToString(tg *TraceGraph) string {
+	var result strings.Builder
+	for _, item := range tg.Graph {
+		result.WriteString(fmt.Sprintf("Node: %s, Type: %s, Value: %v\n", item.Node.ID(), item.Node.Type(), item.Node.Value()))
+	}
+	return result.String()
+}
+
+func (om *OPTOManager) parseResponse(response string) (map[string]interface{}, error) {
+	var updates map[string]interface{}
+	err := json.Unmarshal([]byte(response), &updates)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate response: %w", err)
+		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
-
-	log.Printf("Raw LLM response:\n%s", response)
-
-	// Extract JSON part of the response
-	jsonStart := strings.Index(response, "{")
-	jsonEnd := strings.LastIndex(response, "}")
-	if jsonStart == -1 || jsonEnd == -1 || jsonEnd <= jsonStart {
-		return "", fmt.Errorf("failed to find valid JSON in response")
-	}
-	jsonStr := response[jsonStart : jsonEnd+1]
-
-	// Parse the JSON
-	var parsedResponse OptoPrimeResponse
-	if err := json.Unmarshal([]byte(jsonStr), &parsedResponse); err != nil {
-		return "", fmt.Errorf("failed to parse OptoPrime response: %w", err)
-	}
-
-	// Check if the prompt is empty
-	if parsedResponse.Prompt == "" {
-		return "", fmt.Errorf("received empty prompt from OptoPrime")
-	}
-
-	// Return just the prompt
-	return parsedResponse.Prompt, nil
+	return updates, nil
 }
 
 func cleanJSONResponse(response string) string {
 	// Remove markdown code block syntax if present
 	response = strings.TrimPrefix(response, "```json")
 	response = strings.TrimSuffix(response, "```")
+	response = strings.TrimSpace(response)
 
-	// Remove any text before the first '{' and after the last '}'
+	// Find the first '{' and last '}'
 	start := strings.Index(response, "{")
 	end := strings.LastIndex(response, "}")
-	if start != -1 && end != -1 && end > start {
-		response = response[start : end+1]
+
+	if start != -1 && end != -1 && start < end {
+		return response[start : end+1]
 	}
 
-	return strings.TrimSpace(response)
+	// If we couldn't find valid JSON delimiters, return the original string
+	return response
+}
+
+func (om *OPTOManager) OptoPrime(graph Graph, feedback *Feedback, ctx string) (map[string]interface{}, error) {
+	// Create a graph propagator
+	propagator := NewGraphPropagator(graph)
+
+	// Find the output node
+	outputNode := findOutputNode(graph)
+	if outputNode == nil {
+		return nil, fmt.Errorf("no output node found in graph")
+	}
+
+	// Propagate the minimal subgraph
+	subgraph := propagator.PropagateMinimalSubgraph(graph.Nodes()[0], outputNode)
+
+	// Prepare the prompt for the LLM
+	prompt := om.preparePrompt(subgraph, feedback, ctx)
+
+	// Generate a response from the LLM
+	response, _, err := om.llm.Generate(context.Background(), prompt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate response: %w", err)
+	}
+
+	// Parse the response to get parameter updates
+	updates, err := om.parseResponse(response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OptoPrime response: %w", err)
+	}
+
+	return updates, nil
 }
 
 func extractJSON(s string) string {
@@ -172,6 +182,14 @@ func extractJSON(s string) string {
 		return s[start : end+1]
 	}
 	return ""
+}
+
+func copyParams(params map[string]Parameter) map[string]Parameter {
+	copy := make(map[string]Parameter)
+	for k, v := range params {
+		copy[k] = v
+	}
+	return copy
 }
 
 func (om *OPTOManager) extractSuggestion(response string) (string, error) {
@@ -239,6 +257,14 @@ func graphToString(graph Graph) string {
 	var result strings.Builder
 	for _, node := range graph.Nodes() {
 		result.WriteString(fmt.Sprintf("Node: %s, Type: %s, Value: %v\n", node.ID(), node.Type(), node.Value()))
+	}
+	return result.String()
+}
+
+func subgraphToString(subgraph *TraceGraph) string {
+	var result strings.Builder
+	for id, item := range subgraph.Graph {
+		result.WriteString(fmt.Sprintf("Node: %s, Type: %s, Value: %v\n", id, item.Node.Type(), item.Node.Value()))
 	}
 	return result.String()
 }

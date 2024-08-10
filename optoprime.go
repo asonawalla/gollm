@@ -43,14 +43,36 @@ func NewOptoPrime(l LLM) (*OptoPrime, error) {
 }
 
 func (op *OptoPrime) OptimizePrompt(ctx context.Context, initialPrompt string, iterations int) (string, error) {
-	return op.manager.Optimize(ctx, initialPrompt, iterations)
+	initialParams := map[string]opto.Parameter{
+		"prompt": opto.NewPromptParameter(initialPrompt, ""),
+	}
+
+	optimizedParams, err := op.manager.Optimize(ctx, initialParams, iterations)
+	if err != nil {
+		return "", err
+	}
+
+	if promptParam, ok := optimizedParams["prompt"]; ok {
+		return promptParam.GetValue().(string), nil
+	}
+
+	return "", fmt.Errorf("no optimized prompt found")
 }
 
 type optoExecutor struct {
 	llm LLM
 }
 
-func (e *optoExecutor) Execute(ctx context.Context, prompt string) (interface{}, error) {
+func (e *optoExecutor) Execute(ctx context.Context, params map[string]opto.Parameter) (interface{}, error) {
+	promptParam, ok := params["prompt"]
+	if !ok {
+		return nil, fmt.Errorf("prompt parameter not found")
+	}
+	prompt, ok := promptParam.GetValue().(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid prompt parameter type")
+	}
+
 	response, err := e.llm.Generate(ctx, NewPrompt(prompt))
 	if err != nil {
 		return nil, err
@@ -65,7 +87,7 @@ type optoFeedbackGenerator struct {
 func (fg *optoFeedbackGenerator) GenerateFeedback(result interface{}) *opto.Feedback {
 	response, ok := result.(string)
 	if !ok {
-		return &opto.Feedback{Score: 0, Message: "Invalid result type"}
+		return &opto.Feedback{Score: 0, Message: "Invalid response type"}
 	}
 
 	feedbackPrompt := NewPrompt(fmt.Sprintf(`
