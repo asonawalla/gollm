@@ -41,6 +41,7 @@ func (om *OPTOManager) Optimize(ctx context.Context, initialPrompt string, itera
 	currentPrompt := initialPrompt
 	var bestPrompt string
 	var bestScore float64
+	scores := make([]float64, 0, iterations)
 
 	for i := 0; i < iterations; i++ {
 		log.Printf("Iteration %d - Current Prompt: %s", i, currentPrompt)
@@ -52,16 +53,19 @@ func (om *OPTOManager) Optimize(ctx context.Context, initialPrompt string, itera
 		}
 
 		// 2. Update parameters using OptoPrime
-		updatedPrompt, err := om.OptoPrime(currentPrompt, graph, feedback, om.context)
+		updatedPrompt, err := om.OptoPrime(currentPrompt, graph, feedback, om.context, scores)
 		if err != nil {
-			return "", fmt.Errorf("parameter update failed at iteration %d: %w", err)
+			return "", fmt.Errorf("parameter update failed at iteration %d: %w", i, err)
 		}
 
-		log.Printf("Iteration %d - Updated Prompt: %s", i, updatedPrompt)
+		score := scorePrompt(updatedPrompt, feedback)
+		scores = append(scores, score)
 
-		// 3. Evaluate and store best parameters
-		if feedback.Score > bestScore {
-			bestScore = feedback.Score
+		log.Printf("Iteration %d - Updated Prompt: %s", i, updatedPrompt)
+		log.Printf("Iteration %d - Score: %f", i, score)
+
+		if score > bestScore {
+			bestScore = score
 			bestPrompt = updatedPrompt
 		}
 
@@ -72,13 +76,15 @@ func (om *OPTOManager) Optimize(ctx context.Context, initialPrompt string, itera
 		case <-ctx.Done():
 			return bestPrompt, ctx.Err()
 		default:
+
 		}
 	}
 
 	return bestPrompt, nil
 }
-func (om *OPTOManager) preparePrompt(prompt string, graph Graph, feedback *Feedback, ctx string) string {
+func (om *OPTOManager) preparePrompt(prompt string, graph Graph, feedback *Feedback, ctx string, scores []float64) string {
 	graphStr := graphToString(graph)
+	scoresStr := fmt.Sprintf("%v", scores)
 
 	basePrompt := fmt.Sprintf(`
 Analyze the following information and suggest improvements to the algorithm. Your response must be a single JSON object with the following structure:
@@ -101,14 +107,18 @@ Feedback:
 Score: %.2f
 Message: %s
 
+Previous Scores: %s
+
+Consider the trend in previous scores when suggesting improvements. Aim for prompts that are likely to score higher based on observed patterns.
+
 Ensure your response is a valid JSON object and does not include any text or formatting outside the JSON structure.`,
-		ctx, prompt, graphStr, feedback.Score, feedback.Message)
+		ctx, prompt, graphStr, feedback.Score, feedback.Message, scoresStr)
 
 	return basePrompt
 }
 
-func (om *OPTOManager) OptoPrime(prompt string, graph Graph, feedback *Feedback, ctx string) (string, error) {
-	promptStr := om.preparePrompt(prompt, graph, feedback, ctx)
+func (om *OPTOManager) OptoPrime(prompt string, graph Graph, feedback *Feedback, ctx string, scores []float64) (string, error) {
+	promptStr := om.preparePrompt(prompt, graph, feedback, ctx, scores)
 
 	response, _, err := om.llm.Generate(context.Background(), promptStr)
 	if err != nil {
@@ -129,6 +139,11 @@ func (om *OPTOManager) OptoPrime(prompt string, graph Graph, feedback *Feedback,
 	var parsedResponse OptoPrimeResponse
 	if err := json.Unmarshal([]byte(jsonStr), &parsedResponse); err != nil {
 		return "", fmt.Errorf("failed to parse OptoPrime response: %w", err)
+	}
+
+	// Check if the prompt is empty
+	if parsedResponse.Prompt == "" {
+		return "", fmt.Errorf("received empty prompt from OptoPrime")
 	}
 
 	// Return just the prompt
@@ -226,4 +241,11 @@ func graphToString(graph Graph) string {
 		result.WriteString(fmt.Sprintf("Node: %s, Type: %s, Value: %v\n", node.ID(), node.Type(), node.Value()))
 	}
 	return result.String()
+}
+
+func scorePrompt(prompt string, feedback *Feedback) float64 {
+	if len(prompt) == 0 {
+		return 0 // Return 0 score for empty prompts
+	}
+	return feedback.Score * (1 - float64(len(prompt))/1000) // Penalize very long prompts
 }
